@@ -4,7 +4,12 @@ version = "0.3.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.8"
-dependencies = []
+dependencies = [
+    "timm>=1.0.15",
+    "torch>=2.5.1",
+    "torchvision>=0.20.1",
+    "tqdm>=4.67.1",
+]
 
 [tool.uv]
 package = false
