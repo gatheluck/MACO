@@ -8,7 +8,9 @@
 [![Typing: mypy](https://img.shields.io/badge/typing-mypy-blue)](https://github.com/python/mypy)
 
 This is an unofficial pytorch implementation of the experiments executed in the paper, "[Unlocking Feature Visualization for Deeper Networks with Magnitude Constrained Optimization](https://arxiv.org/abs/2306.06805)" [Fel+, NeurIPS 2023].
-An official implementation by authors is available from [here](https://github.com/deel-ai/xplique/blob/master/xplique/features_visualizations/maco.py).
+
+> [!Note]
+> An official implementation by authors is available from [here](https://github.com/deel-ai/xplique/blob/master/xplique/features_visualizations/maco.py).
 
 ## What is this repo about?
 
