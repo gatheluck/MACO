@@ -149,7 +149,10 @@ def compute_unnormalized_average_magnitude(
     if len(dataloader.dataset) == 0:
         raise ValueError("The dataset is empty.")
 
-    total_magnitude = torch.zeros(3, 224, 224, device=device)
+    first_batch, _ = next(iter(dataloader))
+    H, W = torchvision.transforms.functional.get_image_size(first_batch)  # noqa: N806
+
+    total_magnitude = torch.zeros(3, H, W, device=device)
     total_samples = 0
 
     with torch.no_grad():
@@ -228,6 +231,7 @@ def run_maco(
     target_logit_idx: int = 0,
     num_steps: int = 256,
     learning_rate: float = 1.0,
+    model_input_shape: tuple[int, int] = (224, 224),
 ) -> torch.Tensor:
     """Run MACO algorithm.
 
@@ -245,11 +249,14 @@ def run_maco(
         target_logit_idx (int, optional): Index of the target logit to maximize. Defaults to 0.
         num_steps (int, optional): Number of optimization steps. Defaults to 256.
         learning_rate (float, optional): Learning rate for the optimizer. Defaults to 1.0.
+        model_input_shape (tuple[int, int]): The input shape of the model. Defaults to (224, 224).
 
     Returns:
         torch.Tensor: The optimized phase tensor.
 
     """
+    assert len(model_input_shape) == 2
+
     model = model.to(device)
     unnormalized_average_magnitude = unnormalized_average_magnitude.to(device)
 
@@ -269,7 +276,8 @@ def run_maco(
         x_n = fourier_to_image(unnormalized_average_magnitude, phase)[None, :, :, :]
         normalized_x_n = normalize_transform(x_n)
 
-        H, W = torchvision.transforms.functional.get_image_size(normalized_x_n)  # noqa: N806
+        # NOTE: spectrum shape might be different from model_input_shape.
+        H, W = model_input_shape  # noqa: N806
         cropped_x_n = NormalRandomResizedCrop(mean=0.25, std=0.1, resize_to=(H, W))(
             normalized_x_n
         )
@@ -341,13 +349,25 @@ if __name__ == "__main__":
         )
         torch.save(unnormalized_average_magnitude, unnormalized_average_magnitude_path)
 
+    # upscale the unnormalized_average_magnitude.
+    unnormalized_average_magnitude = unnormalized_average_magnitude.unsqueeze(0)
+    unnormalized_average_magnitude = torch.nn.functional.interpolate(
+        unnormalized_average_magnitude,
+        size=(512, 512),
+        mode="bilinear",
+        align_corners=False,
+    )
+    unnormalized_average_magnitude = unnormalized_average_magnitude.squeeze(0)
+
     print(
         f"unnormalized_average_magnitude.shape: {unnormalized_average_magnitude.shape}"
     )
 
-    model = timm.create_model(
-        "vit_base_patch16_224.augreg2_in21k_ft_in1k", pretrained=True
-    )
+    # model = timm.create_model(
+    #     "vit_base_patch16_224.augreg2_in21k_ft_in1k", pretrained=True
+    # )
+    # model = timm.create_model('vit_large_patch16_224.augreg_in21k_ft_in1k', pretrained=True)
+    model = timm.create_model("resnet50.a1_in1k", pretrained=True)
     model = model.eval()
 
     transform = Compose(
@@ -363,7 +383,8 @@ if __name__ == "__main__":
         device,
         unnormalized_average_magnitude,
         transform,
-        num_steps=256,
+        target_logit_idx=907,
+        num_steps=1024,
         learning_rate=1.0,
     )
 
