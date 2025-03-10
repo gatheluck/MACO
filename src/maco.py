@@ -1,4 +1,3 @@
-import random
 from typing import Literal
 
 import torch
@@ -36,45 +35,69 @@ class NormalRandomResizedCrop:
         The image is cropped at a random position and then resized if a target size is provided.
 
         Args:
-            image (torch.Tensor): shape (C, H, W) or (N, C, H, W)
+            image (torch.Tensor): shape (N, C, H, W)
                 The input image tensor.
 
         Returns:
-            torch.Tensor: shape (C, H, W) or (N, C, H, W)
-                The cropped (and possibly resized) image tensor. The output shape will match the input
-                dimensions (3D or 4D) accordingly.
+            torch.Tensor: shape (N, C, H, W)
+                The cropped (and possibly resized) image tensor. The output shape will match the input dimensions.
 
         """
-        assert image.ndim == 3 or image.ndim == 4
+        assert image.ndim == 4
 
-        H, W = torchvision.transforms.functional.get_image_size(image)  # noqa: N806
+        N, _, H, W = image.shape  # noqa: N806
+        device = image.device
 
         # sample the crop ratio from a normal distribution N(mean, std) and clamp between 0.1 and 1.0.
-        crop_frac = random.gauss(self.mean, self.std)
-        crop_frac = max(0.1, min(1.0, crop_frac))
+        crop_frac = torch.normal(mean=self.mean, std=self.std, size=(N,), device=device)
+        crop_frac = crop_frac.clamp(0.1, 1.0)
 
-        # calculate the crop height and width based on the image dimensions.
-        crop_h = int(H * crop_frac)
-        crop_w = int(W * crop_frac)
+        # crop sizes of each image in the batch.
+        crop_h = (H * crop_frac).floor().to(torch.int64)  # shape: (N,)
+        crop_w = (W * crop_frac).floor().to(torch.int64)  # shape: (N,)
 
         # choose a random crop position ensuring the crop is within image bounds.
-        left = random.randint(0, W - crop_w) if W - crop_w > 0 else 0
-        top = random.randint(0, H - crop_h) if H - crop_h > 0 else 0
-
-        # determine the crop boundaries.
-        bottom = top + crop_h
-        right = left + crop_w
-
-        # crop the image using tensor slicing.
-        batched = image.unsqueeze(0) if image.ndim == 3 else image
-        cropped = batched[:, :, top:bottom, left:right]
-
-        # resize the cropped image using torch.nn.functional.interpolate.
-        resized = torch.nn.functional.interpolate(
-            cropped, size=self.resize_to, mode="bilinear", align_corners=False
+        max_top = (H - crop_h).clamp(min=0)
+        max_left = (W - crop_w).clamp(min=0)
+        top = (
+            (torch.rand(N, device=device) * (max_top + 1).to(torch.float32))
+            .floor()
+            .to(torch.int64)
+        )
+        left = (
+            (torch.rand(N, device=device) * (max_left + 1).to(torch.float32))
+            .floor()
+            .to(torch.int64)
         )
 
-        return resized.squeeze(0) if image.ndim == 3 else resized
+        H_out, W_out = self.resize_to  # noqa: N806
+        v = torch.linspace(0, 1, steps=H_out, device=device).view(
+            1, H_out, 1
+        )  # shape: (1, H_out, 1)
+        u = torch.linspace(0, 1, steps=W_out, device=device).view(
+            1, 1, W_out
+        )  # shape: (1, 1, W_out)
+
+        crop_h = crop_h.view(N, 1, 1).to(torch.float32)
+        crop_w = crop_w.view(N, 1, 1).to(torch.float32)
+        top = top.view(N, 1, 1).to(torch.float32)
+        left = left.view(N, 1, 1).to(torch.float32)
+
+        y_grid = top + v * (crop_h - 1)
+        x_grid = left + u * (crop_w - 1)
+        x_grid, y_grid = torch.broadcast_tensors(x_grid, y_grid)
+
+        # normalize the grid to [-1, 1] for torch.nn.functional.grid_sample.
+        y_grid_norm = (y_grid / (H - 1)) * 2 - 1
+        x_grid_norm = (x_grid / (W - 1)) * 2 - 1
+
+        grid = torch.stack(
+            [x_grid_norm, y_grid_norm], dim=-1
+        )  # shape: (N, H_out, W_out, 2)
+
+        return torch.nn.functional.grid_sample(
+            image, grid, mode="bilinear", align_corners=True
+        )
 
 
 def recorrelate_colors(images: torch.Tensor) -> torch.Tensor:
@@ -230,6 +253,7 @@ def run_maco(
     normalize_transform: torch.nn.Module,
     target_logit_idx: int = 0,
     num_steps: int = 256,
+    num_crops: int = 32,
     learning_rate: float = 1.0,
     model_input_shape: tuple[int, int] = (224, 224),
 ) -> torch.Tensor:
@@ -248,6 +272,7 @@ def run_maco(
         normalize_transform (torch.nn.Module): A transformation module used to normalize the image.
         target_logit_idx (int, optional): Index of the target logit to maximize. Defaults to 0.
         num_steps (int, optional): Number of optimization steps. Defaults to 256.
+        num_crops (int, optional): Number of random crops to generate per image. Defaults to 32.
         learning_rate (float, optional): Learning rate for the optimizer. Defaults to 1.0.
         model_input_shape (tuple[int, int]): The input shape of the model. Defaults to (224, 224).
 
@@ -279,7 +304,7 @@ def run_maco(
         # NOTE: spectrum shape might be different from model_input_shape.
         H, W = model_input_shape  # noqa: N806
         cropped_x_n = NormalRandomResizedCrop(mean=0.25, std=0.1, resize_to=(H, W))(
-            normalized_x_n
+            normalized_x_n.repeat(num_crops, 1, 1, 1)
         )
 
         noise_std = noise_stds[i]
@@ -287,9 +312,9 @@ def run_maco(
         cropped_x_n += torch.rand_like(cropped_x_n) * noise_std - (noise_std / 2.0)
 
         logits = model(cropped_x_n)
-        target_logit = logits[0, target_logit_idx]
+        target_logit = logits[:, target_logit_idx]
 
-        loss = -target_logit
+        loss = -target_logit.mean()
         loss.backward(retain_graph=True)
 
         optimizer.step()
@@ -363,11 +388,11 @@ if __name__ == "__main__":
         f"unnormalized_average_magnitude.shape: {unnormalized_average_magnitude.shape}"
     )
 
-    # model = timm.create_model(
-    #     "vit_base_patch16_224.augreg2_in21k_ft_in1k", pretrained=True
-    # )
+    model = timm.create_model(
+        "vit_base_patch16_224.augreg2_in21k_ft_in1k", pretrained=True
+    )
     # model = timm.create_model('vit_large_patch16_224.augreg_in21k_ft_in1k', pretrained=True)
-    model = timm.create_model("resnet50.a1_in1k", pretrained=True)
+    # model = timm.create_model("resnet50.a1_in1k", pretrained=True)
     model = model.eval()
 
     transform = Compose(
@@ -383,8 +408,8 @@ if __name__ == "__main__":
         device,
         unnormalized_average_magnitude,
         transform,
-        target_logit_idx=907,
-        num_steps=1024,
+        target_logit_idx=967,
+        num_steps=256,
         learning_rate=1.0,
     )
 
