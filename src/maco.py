@@ -6,7 +6,12 @@ from tqdm import tqdm
 
 
 class NormalRandomResizedCrop:
-    """Randomly crops and optionally resizes an image using a normal distribution for the crop ratio."""
+    """Randomly crops and optionally resizes an image using a normal distribution for the crop ratio.
+
+    This class expectes to perform like `torchvision.transforms.RandomResizedCrop`.
+    https://pytorch.org/vision/main/generated/torchvision.transforms.RandomResizedCrop.html
+
+    """
 
     def __init__(
         self,
@@ -246,6 +251,25 @@ def fourier_to_image(
     return torch.nn.functional.sigmoid(image)
 
 
+def normalize(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Normalize the input tensor to the range [0, 1].
+
+    This function subtracts the minimum value from the tensor and divides by the range
+    (max - min) plus a small epsilon for numerical stability, effectively scaling
+    the tensor values to be between 0 and 1.
+
+    Args:
+        x (torch.Tensor): Input tensor to normalize.
+        eps (float, optional): A small value added to the denominator to prevent division
+            by zero. Defaults to 1e-8.
+
+    Returns:
+        torch.Tensor: A tensor with values normalized to the range [0, 1].
+
+    """
+    return (x - x.min()) / (x.max() - x.min() + eps)
+
+
 def run_maco(
     model: torch.nn.Module,
     device: torch.device,
@@ -280,6 +304,8 @@ def run_maco(
         torch.Tensor: The optimized phase tensor.
 
     """
+    assert len(unnormalized_average_magnitude.shape) == 3
+    assert unnormalized_average_magnitude.size(0) == 3
     assert len(model_input_shape) == 2
 
     model = model.to(device)
@@ -292,6 +318,8 @@ def run_maco(
     ) - torch.pi
     phase.requires_grad = True
 
+    alpha = torch.zeros(unnormalized_average_magnitude.shape, device=device)
+
     optimizer = torch.optim.NAdam([phase], lr=learning_rate)
 
     for i in tqdm(range(num_steps)):
@@ -300,12 +328,13 @@ def run_maco(
         # the norm mode here should be the same as the FFT norm used when calculating the average_magnitude.
         x_n = fourier_to_image(unnormalized_average_magnitude, phase)[None, :, :, :]
         normalized_x_n = normalize_transform(x_n)
+        normalized_x_n.requires_grad_(True)
+        normalized_x_n.retain_grad()
 
         # NOTE: spectrum shape might be different from model_input_shape.
-        H, W = model_input_shape  # noqa: N806
-        cropped_x_n = NormalRandomResizedCrop(mean=0.25, std=0.1, resize_to=(H, W))(
-            normalized_x_n.repeat(num_crops, 1, 1, 1)
-        )
+        cropped_x_n = NormalRandomResizedCrop(
+            mean=0.25, std=0.1, resize_to=model_input_shape
+        )(normalized_x_n.repeat(num_crops, 1, 1, 1))
 
         noise_std = noise_stds[i]
         cropped_x_n += torch.randn_like(cropped_x_n) * noise_std
@@ -317,9 +346,12 @@ def run_maco(
         loss = -target_logit.mean()
         loss.backward(retain_graph=True)
 
+        grad_x_n = normalized_x_n.grad.squeeze(0)  # shape: (3, H, W)
+        alpha += grad_x_n.abs()
+
         optimizer.step()
 
-    return phase.cpu().detach()
+    return phase.cpu().detach(), alpha.cpu().detach()
 
 
 if __name__ == "__main__":
@@ -403,16 +435,27 @@ if __name__ == "__main__":
         ]
     )
 
-    phase = run_maco(
+    phase, alpha = run_maco(
         model,
         device,
         unnormalized_average_magnitude,
         transform,
-        target_logit_idx=967,
+        target_logit_idx=1,
         num_steps=256,
+        num_crops=32,
         learning_rate=1.0,
     )
 
     x = fourier_to_image(unnormalized_average_magnitude, phase)
     print(torch.min(x), torch.max(x))
-    vutils.save_image(x, "outputs/maco_result.png")
+
+    alpha_final = torch.mean(alpha, dim=0, keepdim=True)
+    alpha_thresh = torch.quantile(alpha_final, 80.0 / 100.0)
+    alpha_final = torch.clamp(alpha_final, max=alpha_thresh)
+    alpha_final = alpha_final / (alpha_final.max() + 1e-8)  # (1, H, W)
+    alpha_final = alpha_final.repeat(3, 1, 1)  # (3, H, W)
+
+    x_final = x * alpha_final
+    x_final = normalize(x_final)
+
+    vutils.save_image([x, alpha_final, x_final], "outputs/maco_result.png")
