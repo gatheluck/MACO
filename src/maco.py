@@ -251,6 +251,49 @@ def fourier_to_image(
     return torch.nn.functional.sigmoid(image)
 
 
+def normalize_alpha(
+    alpha: torch.Tensor,
+    percentile: float = 80.0,
+) -> torch.Tensor:
+    """Take mean, clamp and normalize alpha.
+
+    This function computes the mean of a 3-channel alpha tensor over its channel dimension,
+    clamps the resulting single-channel tensor by the value at the specified percentile to eliminate extreme values,
+    and normalizes the clamped values to the range [0, 1].
+
+    Args:
+        alpha (torch.Tensor): shape (3, H, W)
+            A tensor representing an alpha with 3 channels.
+        percentile (float, optional): The percentile (between 0.0 and 100.0) used to compute the clamping threshold.
+            Values above this threshold are clamped. Defaults to 80.0.
+
+    Returns:
+        torch.Tensor: shape (1, H, W)
+            A normalized tensor with values scaled to the range [0, 1].
+
+    Raises:
+        AssertionError: If the input tensor does not have 3 dimensions,
+                        if the first dimension is not of size 3, or
+                        if the percentile is not between 0.0 and 100.0.
+
+    """
+    assert len(alpha.shape) == 3
+    assert alpha.size(0) == 3
+    assert 0.0 <= percentile <= 100.0
+
+    alpha_mean = torch.mean(alpha, dim=0, keepdim=True)  # (1, H, W)
+
+    # clamp by the value at the 80th percentile to eliminate extreme values.
+    alpha_clamped = torch.clamp(
+        alpha_mean, max=torch.quantile(alpha_mean, percentile / 100.0)
+    )
+
+    # normalize the alpha to [0, 1].
+    alpha_normalized = alpha_clamped / (alpha_clamped.max() + 1e-8)
+
+    return alpha_normalized
+
+
 def normalize(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """Normalize the input tensor to the range [0, 1].
 
@@ -278,6 +321,7 @@ def run_maco(
     target_logit_idx: int = 0,
     num_steps: int = 256,
     num_crops: int = 32,
+    noise_std: float = -1.0,
     learning_rate: float = 1.0,
     model_input_shape: tuple[int, int] = (224, 224),
 ) -> torch.Tensor:
@@ -297,6 +341,7 @@ def run_maco(
         target_logit_idx (int, optional): Index of the target logit to maximize. Defaults to 0.
         num_steps (int, optional): Number of optimization steps. Defaults to 256.
         num_crops (int, optional): Number of random crops to generate per image. Defaults to 32.
+        noise_std (float, optional): Standard deviation of the noise added to the cropped images.
         learning_rate (float, optional): Learning rate for the optimizer. Defaults to 1.0.
         model_input_shape (tuple[int, int]): The input shape of the model. Defaults to (224, 224).
 
@@ -311,7 +356,14 @@ def run_maco(
     model = model.to(device)
     unnormalized_average_magnitude = unnormalized_average_magnitude.to(device)
 
-    noise_stds = torch.logspace(0, -4, steps=num_steps, dtype=torch.float32)
+    if noise_std == -1.0:
+        noise_stds = torch.logspace(0, -4, steps=num_steps, dtype=torch.float32)
+        get_noise_std = lambda i: noise_stds[i]  # noqa: E731
+    elif isinstance(noise_std, float):
+        assert noise_std > 0.0
+        get_noise_std = lambda _: noise_std  # noqa: E731
+    else:
+        raise ValueError(f"Invalid noise_std argument: {noise_std}")
 
     phase = (
         2 * torch.pi * torch.rand(unnormalized_average_magnitude.shape, device=device)
@@ -336,7 +388,7 @@ def run_maco(
             mean=0.25, std=0.1, resize_to=model_input_shape
         )(normalized_x_n.repeat(num_crops, 1, 1, 1))
 
-        noise_std = noise_stds[i]
+        noise_std = get_noise_std(i)  # type: ignore[no-untyped-call]
         cropped_x_n += torch.randn_like(cropped_x_n) * noise_std
         cropped_x_n += torch.rand_like(cropped_x_n) * noise_std - (noise_std / 2.0)
 
