@@ -62,6 +62,12 @@ parser.add_argument(
     default=32,
 )
 parser.add_argument(
+    "--average-crop-size",
+    "-a",
+    type=float,
+    default=-1.0,
+)
+parser.add_argument(
     "--noise-std",
     "-n",
     type=float,
@@ -109,6 +115,7 @@ phase, alpha = run_maco(
     target_logit_idx=args.target_logit_idx,
     num_steps=args.num_steps,
     num_crops=args.num_crops,
+    average_crop_size=args.average_crop_size,
     noise_std=args.noise_std,
     learning_rate=1.0,
 )
@@ -120,5 +127,6 @@ x_alpha = normalize(x * alpha_normalized)
 
 vutils.save_image(
     [x, alpha_normalized.repeat(3, 1, 1), x_alpha],
-    args.output_dir_path / "maco_result.png",
+    args.output_dir_path
+    / f"maco_target:{args.target_logit_idx:03d}_crop:{args.average_crop_size}_noise:{args.noise_std}.png",
 )

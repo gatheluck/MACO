@@ -6,102 +6,99 @@ from tqdm import tqdm
 
 
 class NormalRandomResizedCrop:
-    """Randomly crops and optionally resizes an image using a normal distribution for the crop ratio.
+    """Performs a random resized crop on a batch of normalized RGB images.
 
-    This class expectes to perform like `torchvision.transforms.RandomResizedCrop`.
-    https://pytorch.org/vision/main/generated/torchvision.transforms.RandomResizedCrop.html
+    This transform samples random crop boxes from each image based on a normal distribution
+    for the center coordinates and crop size. The crop boxes are then applied using an affine
+    transformation so that the output is resized to a specified target size.
+
+    Attributes:
+        output_size (tuple[int, int]): The desired output image size as (height, width).
+        average_crop_size (float): The average size of the crop (in normalized coordinates).
+        center_std (float): The standard deviation for sampling the crop center.
+        delta_std (float): The standard deviation for sampling the crop size.
+        min_crop (float): The minimum allowable crop size (normalized).
+        max_crop (float): The maximum allowable crop size (normalized).
 
     """
 
     def __init__(
         self,
-        mean: float = 0.25,
-        std: float = 0.1,
-        resize_to: tuple[int, int] = (224, 224),
-    ):
-        """Initializes the NormalRandomResizedCrop transformation.
+        output_size: tuple[int, int] = (224, 224),
+        average_crop_size: float = 0.25,
+        center_std: float = 0.15,
+        delta_std: float = 0.05,
+        min_crop: float = 0.05,
+        max_crop: float = 1.0,
+    ) -> None:
+        """Initializes the NormalRandomResizedCrop transform.
 
         Args:
-            mean (float, optional): The mean ratio for the crop size relative to the image dimensions.
-            std (float, optional): The standard deviation of the crop size ratio.
-            resize_to (tuple): The target size to resize the cropped image (e.g., (224, 224)).
-                If None, no resizing is performed.
+            output_size (tuple[int, int]): The output image size as (height, width).
+            average_crop_size (float): The average crop size in normalized coordinates.
+            center_std (float): Standard deviation for the crop center sampling.
+            delta_std (float): Standard deviation for the crop size sampling.
+            min_crop (float): The minimum crop size (normalized).
+            max_crop (float): The maximum crop size (normalized).
 
         """
-        assert len(resize_to) == 2
-        self.mean = mean
-        self.std = std
-        self.resize_to = resize_to
+        assert len(output_size) == 2
+        assert 0.0 <= average_crop_size <= 1.0
+        assert center_std >= 0.0
+        assert delta_std >= 0.0
+        assert 0.0 <= min_crop <= 1.0
+        assert 0.0 <= max_crop <= 1.0
+        self.output_size = output_size
+        self.average_crop_size = average_crop_size
+        self.center_std = center_std
+        self.delta_std = delta_std
+        self.min_crop = min_crop
+        self.max_crop = max_crop
 
-    def __call__(self, image: torch.Tensor) -> torch.Tensor:
-        """Randomly crops and optionally resizes the input image using a normal distribution for the crop ratio.
+    def __call__(self, images: torch.Tensor) -> torch.Tensor:
+        """Applies the transform to a batch of images.
 
-        The crop ratio is sampled from a normal distribution N(mean, std) and clamped between 0.1 and 1.0.
-        The image is cropped at a random position and then resized if a target size is provided.
+        The input images are assumed to be normalized and have shape (B, 3, H, W).
 
         Args:
-            image (torch.Tensor): shape (N, C, H, W)
-                The input image tensor.
+            images (torch.Tensor): shape (B, 3, H, W)
+                A batch of normalized RGB images.
 
         Returns:
-            torch.Tensor: shape (N, C, H, W)
-                The cropped (and possibly resized) image tensor. The output shape will match the input dimensions.
+            torch.Tensor: shape (B, 3, output_height, output_width)
+                Cropped and resized images.
 
         """
-        assert image.ndim == 4
+        B, C, _, _ = images.shape  # noqa: N806
+        device = images.device
+        target_h, target_w = self.output_size
 
-        N, _, H, W = image.shape  # noqa: N806
-        device = image.device
+        # sample random centers and crop sizes for the entire batch.
+        center_x = 0.5 + torch.randn(B, device=device) * self.center_std
+        center_y = 0.5 + torch.randn(B, device=device) * self.center_std
+        delta = self.average_crop_size + torch.randn(B, device=device) * self.delta_std
+        delta = delta.clamp(
+            self.min_crop, self.max_crop
+        )  # Clamp crop sizes to [min_crop, max_crop]
 
-        # sample the crop ratio from a normal distribution N(mean, std) and clamp between 0.1 and 1.0.
-        crop_frac = torch.normal(mean=self.mean, std=self.std, size=(N,), device=device)
-        crop_frac = crop_frac.clamp(0.1, 1.0)
+        # construct the affine transformation matrices.
+        # For each image, define an affine transformation matrix theta that maps output coordinates in [-1, 1]
+        # to the normalized input image coordinates. Here, the scale is set to delta, and the translation is
+        # set to 2 * center - 1, which converts the center from [0, 1] range to [-1, 1].
+        theta = torch.zeros(B, 2, 3, device=device)
+        theta[:, 0, 0] = delta  # Scaling in the x direction.
+        theta[:, 1, 1] = delta  # Scaling in the y direction.
+        theta[:, 0, 2] = 2 * center_x - 1  # Translation in the x direction.
+        theta[:, 1, 2] = 2 * center_y - 1  # Translation in the y direction.
 
-        # crop sizes of each image in the batch.
-        crop_h = (H * crop_frac).floor().to(torch.int64)  # shape: (N,)
-        crop_w = (W * crop_frac).floor().to(torch.int64)  # shape: (N,)
-
-        # choose a random crop position ensuring the crop is within image bounds.
-        max_top = (H - crop_h).clamp(min=0)
-        max_left = (W - crop_w).clamp(min=0)
-        top = (
-            (torch.rand(N, device=device) * (max_top + 1).to(torch.float32))
-            .floor()
-            .to(torch.int64)
+        # generate a sampling grid for all samples at once using the affine transformation matrices.
+        grid = torch.nn.functional.affine_grid(
+            theta, size=(B, C, target_h, target_w), align_corners=True
         )
-        left = (
-            (torch.rand(N, device=device) * (max_left + 1).to(torch.float32))
-            .floor()
-            .to(torch.int64)
-        )
 
-        H_out, W_out = self.resize_to  # noqa: N806
-        v = torch.linspace(0, 1, steps=H_out, device=device).view(
-            1, H_out, 1
-        )  # shape: (1, H_out, 1)
-        u = torch.linspace(0, 1, steps=W_out, device=device).view(
-            1, 1, W_out
-        )  # shape: (1, 1, W_out)
-
-        crop_h = crop_h.view(N, 1, 1).to(torch.float32)
-        crop_w = crop_w.view(N, 1, 1).to(torch.float32)
-        top = top.view(N, 1, 1).to(torch.float32)
-        left = left.view(N, 1, 1).to(torch.float32)
-
-        y_grid = top + v * (crop_h - 1)
-        x_grid = left + u * (crop_w - 1)
-        x_grid, y_grid = torch.broadcast_tensors(x_grid, y_grid)
-
-        # normalize the grid to [-1, 1] for torch.nn.functional.grid_sample.
-        y_grid_norm = (y_grid / (H - 1)) * 2 - 1
-        x_grid_norm = (x_grid / (W - 1)) * 2 - 1
-
-        grid = torch.stack(
-            [x_grid_norm, y_grid_norm], dim=-1
-        )  # shape: (N, H_out, W_out, 2)
-
+        # crop and resize the images using grid_sample.
         return torch.nn.functional.grid_sample(
-            image, grid, mode="bilinear", align_corners=True
+            images, grid, mode="bilinear", padding_mode="zeros", align_corners=True
         )
 
 
@@ -321,6 +318,7 @@ def run_maco(
     target_logit_idx: int = 0,
     num_steps: int = 256,
     num_crops: int = 32,
+    average_crop_size: float = -1.0,
     noise_std: float = -1.0,
     learning_rate: float = 1.0,
     model_input_shape: tuple[int, int] = (224, 224),
@@ -341,6 +339,7 @@ def run_maco(
         target_logit_idx (int, optional): Index of the target logit to maximize. Defaults to 0.
         num_steps (int, optional): Number of optimization steps. Defaults to 256.
         num_crops (int, optional): Number of random crops to generate per image. Defaults to 32.
+        average_crop_size (float, optional): Average crop size for random resized cropping. Defaults to -1.0.
         noise_std (float, optional): Standard deviation of the noise added to the cropped images.
         learning_rate (float, optional): Learning rate for the optimizer. Defaults to 1.0.
         model_input_shape (tuple[int, int]): The input shape of the model. Defaults to (224, 224).
@@ -356,6 +355,21 @@ def run_maco(
     model = model.to(device)
     unnormalized_average_magnitude = unnormalized_average_magnitude.to(device)
 
+    # define get_crop_transform function based on the average_crop_size argument.
+    if average_crop_size == -1.0:
+        crop_transforms = [
+            NormalRandomResizedCrop(model_input_shape, average_crop_size=b)
+            for b in torch.linspace(0.5, 0.05, steps=num_steps, dtype=torch.float32)
+        ]
+        get_crop_transform = lambda step: crop_transforms[step]  # noqa: E731
+    elif isinstance(average_crop_size, float):
+        get_crop_transform = lambda _: NormalRandomResizedCrop(  # noqa: E731
+            model_input_shape, average_crop_size=average_crop_size
+        )
+    else:
+        raise ValueError(f"Invalid average_crop_size argument: {average_crop_size}")
+
+    # define get_noise_std function based on the noise_std argument.
     if noise_std == -1.0:
         noise_stds = torch.logspace(0, -4, steps=num_steps, dtype=torch.float32)
         get_noise_std = lambda i: noise_stds[i]  # noqa: E731
@@ -384,9 +398,7 @@ def run_maco(
         normalized_x_n.retain_grad()
 
         # NOTE: spectrum shape might be different from model_input_shape.
-        cropped_x_n = NormalRandomResizedCrop(
-            mean=0.25, std=0.1, resize_to=model_input_shape
-        )(normalized_x_n.repeat(num_crops, 1, 1, 1))
+        cropped_x_n = get_crop_transform(i)(normalized_x_n.repeat(num_crops, 1, 1, 1))  # type: ignore[no-untyped-call]
 
         noise_std = get_noise_std(i)  # type: ignore[no-untyped-call]
         cropped_x_n += torch.randn_like(cropped_x_n) * noise_std
