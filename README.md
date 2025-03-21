@@ -9,8 +9,9 @@
 
 This is an unofficial pytorch implementation of the experiments executed in the paper, "[Unlocking Feature Visualization for Deeper Networks with Magnitude Constrained Optimization](https://arxiv.org/abs/2306.06805)" [Fel+, NeurIPS 2023].
 
-> [!Note]
-> An official implementation by authors is available from [here](https://github.com/deel-ai/xplique/blob/master/xplique/features_visualizations/maco.py).
+> [!Important]
+> Now, an official PyTorch implementation by authors is available as a library ([Horama](https://github.com/serre-lab/Horama)). I highly recommend to use it instead of this repo.
+> An official TensorFlow implementation by authors is also available from [here](https://github.com/deel-ai/xplique/blob/master/xplique/features_visualizations/maco.py).
 
 ## What is this repo about?
 
